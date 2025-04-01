@@ -1,159 +1,90 @@
-;;; gptel-copilot.el --- Copilot chat integration for gptel -*- lexical-binding: t; -*-
 
-;; Author: Your Name <you@example.com>
+;;; gptel-copilot.el --- GitHub Copilot integration for gptel -*- lexical-binding: t; -*-
+
 ;; Keywords: convenience, tools
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
 
-;; This file provides a backend for gptel that integrates with GitHub Copilot chat.
+;; This package provides GitHub Copilot Chat integration for gptel.
+;; It allows you to use GitHub Copilot's chat models with gptel's interface.
+;; Authentication is handled through GitHub's OAuth device flow.
 
 ;;; Code:
-(require 'cl-generic)
-(eval-when-compile
-  (require 'cl-lib))
-;(require 'json)
+(require 'cl-lib)
+(require 'gptel-openai)
 (require 'request)
-(require 'gptel)
+(require 'xdg)
 
-(defvar json-object-type)
+(declare-function browse-url "browse-url" (url &optional new-window))
 
-(declare-function prop-match-value "text-property-search")
-(declare-function text-property-search-backward "text-property-search")
-(declare-function json-read "json" ())
-(declare-function gptel-context--wrap "gptel-context")
-(declare-function gptel-context--collect-media "gptel-context")
+;;; Customization options
 
-;; NOTE: Github Copilot requires oauth.
-;; Github oauth flow
-;; 1. oauth access token -> 2. session token + expires_at -> renew session token
-(cl-defstruct (gptel-copilot-chat
-               (:copier nil))
-  "Struct for Copilot chat state."
-  (ready nil :type boolean)
-  (github-token nil :type (or null string))
-  (token nil)
-  (sessionid nil :type (or null string))
-  (machineid nil :type (or null string))
-  (history nil :type list)
-  (buffers nil :type list)
+(defgroup gptel-copilot nil
+  "GitHub Copilot integration for gptel."
+  :group 'gptel)
+
+(defcustom gptel-copilot-access-token-file
+  (expand-file-name "github-access-token" (concat (xdg-config-home) "/gptel"))
+  "File to store the GitHub access token for Copilot authentication."
+  :type 'file
+  :group 'gptel-copilot)
+
+(defcustom gptel-copilot-cache-dir
+  (concat (xdg-cache-home) "/gptel")
+  "Directory to store Copilot cache files."
+  :type 'directory
+  :group 'gptel-copilot)
+
+(defcustom gptel-copilot-models-cache-expiry (* 60 60 24)
+  "Time in seconds after which the models cache is considered stale (24 hours by default)."
+  :type 'natnum
+  :group 'gptel-copilot)
+
+(defcustom gptel-copilot-debug nil
+  "Whether to enable debug output for gptel-copilot."
+  :type 'boolean
+  :group 'gptel-copilot)
+
+;;; Internal variables
+
+(defvar gptel-copilot--token-file
+  (expand-file-name "copilot-token.json" gptel-copilot-cache-dir)
+  "File to store the Copilot session token.")
+
+(defvar gptel-copilot--models-cache-file
+  (expand-file-name "copilot-models.json" gptel-copilot-cache-dir)
+  "File to store cached Copilot models.")
+
+;;; State management
+
+(cl-defstruct (gptel-copilot-state
+               (:constructor gptel-copilot--make-state))
+  "Copilot state information."
+  (access-token nil :type (or null string))
+  (session-token nil :type (or null list))
   (models nil :type list)
-  (last-models-fetch-time 0 :type number))
+  (models-last-fetched 0 :type number))
 
-(defvar gptel-copilot-chat--instance
-  (make-gptel-copilot-chat
-   :ready nil
-   :github-token nil
-   :token nil
-   :sessionid nil
-   :machineid nil
-   :history nil
-   :buffers nil
-   :models nil
-   :last-models-fetch-time 0)
-  "Global instance of Copilot chat.")
+(defvar gptel-copilot--state (gptel-copilot--make-state)
+  "Global Copilot state.")
 
-(defvar gptel-copilot-chat-debug 't)
-(defvar gptel-copilot-chat-github-token-file "~/.config/gptel/github-token")
+;;; Utility functions
 
-(cl-defun gptel-copilot-chat--request-token-cb (&key response
-                                               &key data
-                                               &allow-other-keys)
-  "Manage token reception for github auth.
-Argument DATA is whatever PARSER function returns, or nil.
-Argument RESPONSE is request-response object."
-  (unless (= (request-response-status-code response) 200)
-    (error "Http error"))
-  (let (
-        (token (alist-get 'access_token data))
-        (token-dir (file-name-directory (expand-file-name gptel-copilot-chat-github-token-file))))
-    (setf (gptel-copilot-chat-github-token gptel-copilot-chat--instance) token)
-    (when (not (file-directory-p token-dir))
-      (make-directory token-dir t))
-    (with-temp-file gptel-copilot-chat-github-token-file
-      (insert token))))
+(defun gptel-copilot--log (format-string &rest args)
+  "Log message if debug is enabled.
+FORMAT-STRING and ARGS are passed to `message'."
+  (when gptel-copilot-debug
+    (apply #'message (concat "[gptel-copilot] " format-string) args)))
 
-(cl-defun gptel-copilot-chat--request-code-cb (&key response
-                                              &key data
-                                              &allow-other-keys)
-  "Manage user code reception for github buth.
-Argument RESPONSE is request-response object.
-Argument DATA is whatever PARSER function returns, or nil."
-  (unless (= (request-response-status-code response) 200)
-    (error "Http error"))
-  (let ((device-code (alist-get 'device_code data))
-        (user-code (alist-get 'user_code data))
-        (verification-uri (alist-get 'verification_uri data)))
-    (gui-set-selection 'CLIPBOARD user-code)
-    (read-from-minibuffer
-     (format "Your one-time code %s is copied. \
-Press ENTER to open GitHub in your browser. \
-If your browser does not open automatically, browse to %s."
-             user-code verification-uri))
-    (browse-url verification-uri)
-    (read-from-minibuffer "Press ENTER after authorizing.")
+(defun gptel-copilot--ensure-directories ()
+  "Ensure that necessary directories exist."
+  (unless (file-directory-p gptel-copilot-cache-dir)
+    (make-directory gptel-copilot-cache-dir t))
+  (unless (file-directory-p (file-name-directory gptel-copilot-access-token-file))
+    (make-directory (file-name-directory gptel-copilot-access-token-file) t)))
 
-    (request "https://github.com/login/oauth/access_token"
-      :type "POST"
-      :headers `(("content-type" . "application/json")
-                 ("accept" . "application/json")
-                 ("editor-plugin-version" . "CopilotChat.nvim/2.0.0")
-                 ("editor-version" . "Neovim/0.10.0")
-                 ("user-agent" . "CopilotChat.nvim/2.0.0"))
-      :data (format "{\"client_id\":\"Iv1.b507a08c87ecfe98\",\"device_code\":\"%s\",\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\"}" device-code)
-      :parser 'json-read
-      :sync t
-      :complete #'gptel-copilot-chat--request-token-cb)))
-
-(defun gptel-copilot--request-login ()
-  "Manage GitHub login for Copilot."
-  (request
-   "https://github.com/login/device/code"
-    :type "POST"
-    :data "{\"client_id\":\"Iv1.b507a08c87ecfe98\",\"scope\":\"read:user\"}"
-    :sync t
-    :headers `(("content-type" . "application/json")
-               ("accept" . "application/json")
-               ("editor-plugin-version" . "CopilotChat.nvim/2.0.0")
-               ("user-agent" . "CopilotChat.nvim/2.0.0")
-               ("editor-version" . "Neovim/0.10.0"))
-    :parser 'json-read
-    :complete #'gptel-copilot-chat--request-code-cb))
-
-;; Session token
-(defvar gptel-copilot-chat-token-cache "~/.cache/gptel/token")
-(cl-defun gptel-copilot-chat--request-renew-token-cb(&key response
-                                                    &key data
-                                                    &allow-other-keys)
-  "Renew token callback.
-Argument RESPONSE is request-response object.
-Argument DATA is whatever PARSER function returns, or nil."
-  (unless (= (request-response-status-code response) 200)
-    (error "Authentication error"))
-  (setf (gptel-copilot-chat-token gptel-copilot-chat--instance) data)
-  ;; save token in copilot-chat-token-cache file after creating
-  ;; folders if needed
-  (let ((cache-dir (file-name-directory (expand-file-name gptel-copilot-chat-token-cache))))
-    (when (not (file-directory-p cache-dir))
-      (make-directory  cache-dir t))
-    (with-temp-file gptel-copilot-chat-token-cache
-      (insert (json-encode data)))))
-
-(defun gptel-copilot-chat--request-renew-token()
-  "Renew session token."
-  (request "https://api.github.com/copilot_internal/v2/token"
-    :type "GET"
-    :headers `(("authorization" . ,(concat "token " (gptel-copilot-chat-github-token gptel-copilot-chat--instance)))
-               ("accept" . "application/json")
-               ("editor-version" . "Neovim/0.10.0")
-               ("editor-plugin-version" . "CopilotChat.nvim/2.0.0")
-               ("user-agent" . "CopilotChat.nvim/2.0.0"))
-    :parser 'json-read
-    :sync t
-    :complete #'gptel-copilot-chat--request-renew-token-cb))
-
-;; Helper funcs
-(defun gptel-copilot-chat--uuid ()
+(defun gptel-copilot--uuid ()
   "Generate a UUID."
   (format "%04x%04x-%04x-4%03x-%04x-%04x%04x%04x"
           (random 65536) (random 65536)
@@ -162,159 +93,282 @@ Argument DATA is whatever PARSER function returns, or nil."
           (logior (random 4096) 32768)
           (random 65536) (random 65536) (random 65536)))
 
-(defun gptel-copilot-chat--get-headers ()
-  "Get headers for Copilot API requests."
-  `(("authorization" . ,(concat "Bearer " (gptel-copilot--get-session-token)))
-    ("content-type" . "application/json")
-    ("accept" . "application/json")
-    ;;("user-agent" . "CopilotChat.nvim/2.0.0")
-    ("editor-version" . "Neovim/0.10.0")
-    ;;("editor-plugin-version" . "CopilotChat.nvim/2.0.0")
-    ;;("x-request-id" . ,(gptel-copilot-chat--uuid))
-    ;;("vscode-sessionid" . ,(gptel-copilot-chat-sessionid gptel-copilot-chat--instance))
-    ;;("vscode-machineid" . ,(gptel-copilot-chat-machineid gptel-copilot-chat--instance))
-    ("copilot-integration-id" . "vscode-chat")
-    ("openai-intent" . "conversation-panel")
-    ("openai-organization" . "github-copilot")
-    ))
+;;; Authentication
 
-;; NOTE: Getting and enabling models
-(defun gptel-copilot-chat--request-enable-model-policy (model-id)
-  "Enable policy for MODEL-ID."
-  (let ((url (format "https://api.githubcopilot.com/models/%s/policy" model-id))
-        (headers (gptel-copilot-chat--get-headers))
-        (data (json-encode '((state . "enabled")))))
-    (when gptel-copilot-chat-debug
-      (message "Enabling policy for model %s" model-id))
-    (request url
-      :type "POST"
-      :headers headers
-      :data data
-      :parser 'json-read)))
+(defun gptel-copilot--get-access-token ()
+  "Get GitHub access token for authentication."
+  (if (gptel-copilot-state-access-token gptel-copilot--state)
+      (gptel-copilot-state-access-token gptel-copilot--state)
+    (if (file-exists-p gptel-copilot-access-token-file)
+        (let ((token (with-temp-buffer
+                       (insert-file-contents gptel-copilot-access-token-file)
+                       (string-trim (buffer-string)))))
+          (setf (gptel-copilot-state-access-token gptel-copilot--state) token)
+          token)
+      (gptel-copilot--initiate-login))))
 
-(defvar gptel-copilot-chat-models-cache-file "~/.cache/gptel/models.json")
+(defun gptel-copilot--initiate-login ()
+  "Start the GitHub login process for Copilot."
+  (gptel-copilot--log "Starting GitHub login process")
 
-(defun gptel-copilot-chat--save-models-to-cache (models)
+  (request "https://github.com/login/device/code"
+    :type "POST"
+    :data "{\"client_id\":\"Iv1.b507a08c87ecfe98\",\"scope\":\"read:user\"}"
+    :headers '(("content-type" . "application/json")
+               ("accept" . "application/json")
+               ("editor-plugin-version" . "gptel-copilot/1.0.0")
+               ("user-agent" . "gptel-copilot/1.0.0")
+               ("editor-version" . "Emacs"))
+    :parser 'json-read
+    :success (cl-function
+              (lambda (&key data &allow-other-keys)
+                (let ((device-code (alist-get 'device_code data))
+                      (user-code (alist-get 'user_code data))
+                      (verification-uri (alist-get 'verification_uri data)))
+
+                  (gptel-copilot--log "Got device code and user code")
+
+                  ;; Copy to clipboard and prompt user
+                  (kill-new user-code)
+                  (read-from-minibuffer
+                   (format "Your one-time code %s is copied to clipboard. Press ENTER to open GitHub."
+                           user-code))
+
+                  (browse-url verification-uri)
+                  (read-from-minibuffer "Press ENTER after authorizing in browser.")
+
+                  ;; Exchange the code for a token
+                  (gptel-copilot--exchange-code-for-token device-code))))
+    :error (cl-function
+            (lambda (&key error-thrown &allow-other-keys)
+              (error "Failed to start GitHub login: %s" error-thrown)))))
+
+(defun gptel-copilot--exchange-code-for-token (device-code)
+  "Exchange DEVICE-CODE for a GitHub access token."
+  (gptel-copilot--log "Exchanging device code for token")
+
+  (request "https://github.com/login/oauth/access_token"
+    :type "POST"
+    :headers '(("content-type" . "application/json")
+               ("accept" . "application/json")
+               ("editor-plugin-version" . "gptel-copilot/1.0.0")
+               ("user-agent" . "gptel-copilot/1.0.0"))
+    :data (format "{\"client_id\":\"Iv1.b507a08c87ecfe98\",\"device_code\":\"%s\",\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\"}"
+                  device-code)
+    :parser 'json-read
+    :success (cl-function
+              (lambda (&key data &allow-other-keys)
+                (let ((token (alist-get 'access_token data)))
+                  (unless token
+                    (error "No access token received from GitHub"))
+
+                  (gptel-copilot--ensure-directories)
+                  (with-temp-file gptel-copilot-access-token-file
+                    (insert token))
+
+                  (setf (gptel-copilot-state-access-token gptel-copilot--state) token))))
+    :error (cl-function
+            (lambda (&key error-thrown &allow-other-keys)
+              (error "Failed to get access token: %s" error-thrown)))))
+
+;;; Session token management
+
+(defun gptel-copilot-login()
+  (interactive)
+  (let ((gptel-copilot-debug 't))
+        (gptel-copilot--get-session-token)))
+
+(defun gptel-copilot--get-session-token ()
+  "Get or refresh Copilot session token."
+  (gptel-copilot--log "Getting session token")
+
+  ;; Ensure we have a GitHub token first
+  (gptel-copilot--get-access-token)
+
+  ;; Try to load cached token
+  (unless (gptel-copilot-state-session-token gptel-copilot--state)
+    (when (file-exists-p gptel-copilot--token-file)
+      (condition-case nil
+          (with-temp-buffer
+            (insert-file-contents gptel-copilot--token-file)
+            (setf (gptel-copilot-state-session-token gptel-copilot--state)
+                  (json-read-from-string (buffer-string))))
+        (error
+         (gptel-copilot--log "Error loading token from cache")
+         nil))))
+
+  ;; Check if token needs refresh
+  (when (or (null (gptel-copilot-state-session-token gptel-copilot--state))
+            (> (float-time)
+               (alist-get 'expires_at (gptel-copilot-state-session-token gptel-copilot--state))))
+    (gptel-copilot--refresh-session-token))
+
+  ;; Return the actual token string
+  (alist-get 'token (gptel-copilot-state-session-token gptel-copilot--state)))
+
+(defun gptel-copilot--refresh-session-token ()
+  "Refresh the Copilot session token."
+  (gptel-copilot--log "Refreshing Copilot session token")
+
+  (request "https://api.github.com/copilot_internal/v2/token"
+    :type "GET"
+    :headers `(("authorization" . ,(concat "token " (gptel-copilot-state-access-token gptel-copilot--state)))
+               ("accept" . "application/json")
+               ("editor-version" . "Emacs")
+               ("editor-plugin-version" . "gptel-copilot/1.0.0")
+               ("user-agent" . "gptel-copilot/1.0.0"))
+    :parser 'json-read
+    :success (cl-function
+              (lambda (&key data &allow-other-keys)
+                (setf (gptel-copilot-state-session-token gptel-copilot--state) data)
+
+                ;; Cache the token
+                (gptel-copilot--ensure-directories)
+                (with-temp-file gptel-copilot--token-file
+                  (insert (json-encode data)))))
+    :error (cl-function
+            (lambda (&key error-thrown &allow-other-keys)
+              (error "Failed to refresh Copilot token: %s" error-thrown)))))
+
+;;; Model handling
+
+(defun gptel-copilot--get-models (&optional callback)
+  "Get available Copilot models.
+If CALLBACK is provided, call it with the models when ready."
+  (gptel-copilot--log "Getting Copilot models")
+
+  ;; Try to load from cache if models are empty
+  (when (and (null (gptel-copilot-state-models gptel-copilot--state))
+             (file-exists-p gptel-copilot--models-cache-file))
+    (gptel-copilot--load-models-from-cache))
+
+  ;; Check if we need to refresh models
+  (let ((current-time (float-time))
+        (need-refresh nil))
+    (when (or (null (gptel-copilot-state-models gptel-copilot--state))
+              (> current-time
+                 (+ (gptel-copilot-state-models-last-fetched gptel-copilot--state)
+                    gptel-copilot-models-cache-expiry)))
+      (setq need-refresh t)
+      (gptel-copilot--fetch-models callback))
+
+    ;; If we don't need to refresh and have a callback, call it immediately
+    (when (and callback (not need-refresh))
+      (funcall callback (gptel-copilot-state-models gptel-copilot--state))))
+
+  ;; Return current models (could be nil if async fetch is in progress)
+  (gptel-copilot-state-models gptel-copilot--state))
+
+(defun gptel-copilot--load-models-from-cache ()
+  "Load Copilot models from cache."
+  (gptel-copilot--log "Loading models from cache")
+
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents gptel-copilot--models-cache-file)
+        (let* ((cache-data (json-read-from-string (buffer-string)))
+               (timestamp (alist-get 'timestamp cache-data))
+               (models (alist-get 'models cache-data)))
+          (setf (gptel-copilot-state-models gptel-copilot--state) models)
+          (setf (gptel-copilot-state-models-last-fetched gptel-copilot--state) timestamp)
+          (gptel-copilot--log "Loaded %d models from cache" (length models))))
+    (error
+     (gptel-copilot--log "Error loading models from cache")
+     nil)))
+
+(defun gptel-copilot--fetch-models (&optional callback)
+  "Fetch available models from Copilot API.
+If CALLBACK is provided, call it with the models when ready."
+  (gptel-copilot--log "Fetching models from Copilot API")
+  (message "Fetching Copilot models...")
+
+  (request "https://api.githubcopilot.com/models"
+    :type "GET"
+    :headers (gptel-copilot--request-headers)
+    :parser 'json-read
+    :success (cl-function
+              (lambda (&key data &allow-other-keys)
+                (let* ((models-vector (alist-get 'data data))
+                       (models (append models-vector nil))
+                       (chat-models nil))
+
+                  ;; Filter for chat models
+                  (dolist (model models)
+                    (when (and (alist-get 'capabilities model)
+                               (equal (alist-get 'type (alist-get 'capabilities model)) "chat"))
+                      (push model chat-models)))
+
+                  (let ((sorted-models (nreverse chat-models)))
+                    ;; Store models
+                    (setf (gptel-copilot-state-models gptel-copilot--state) sorted-models)
+                    (setf (gptel-copilot-state-models-last-fetched gptel-copilot--state) (float-time))
+
+                    ;; Cache models
+                    (gptel-copilot--save-models-to-cache sorted-models)
+
+                    ;; Enable policies for models if needed
+                    (dolist (model sorted-models)
+                      (when (and (alist-get 'policy model)
+                                 (equal (alist-get 'state (alist-get 'policy model)) "unconfigured"))
+                        (gptel-copilot--enable-model-policy (alist-get 'id model))))
+
+                    (message "Fetched %d Copilot models" (length sorted-models))
+                    (when callback
+                      (funcall callback sorted-models))))))
+    :error (cl-function
+            (lambda (&key error-thrown &allow-other-keys)
+              (message "Error fetching models: %S" error-thrown)
+              (when callback
+                (funcall callback nil))))))
+
+(defun gptel-copilot--save-models-to-cache (models)
   "Save MODELS to disk cache."
   (when models
-    (let ((cache-data `((timestamp . ,(round (float-time)))
-                        (models . ,models)))
-          (copilot-chat-models-cache-file "~/.cache/gptel/models.json"))
-      (with-temp-file copilot-chat-models-cache-file
+    (let ((cache-data `((timestamp . ,(float-time))
+                        (models . ,models))))
+
+      (gptel-copilot--ensure-directories)
+      (with-temp-file gptel-copilot--models-cache-file
         (insert (json-encode cache-data)))
-      (when gptel-copilot-chat-debug
-        (message "Saved %d models to cache %s" (length models) gptel-copilot-chat-models-cache-file)))))
 
-(cl-defun gptel-copilot-chat--request-models-cb (&key response
-                                                &key data
-                                                &allow-other-keys)
-  "Handle models response from Copilot API.
-Argument DATA is the parsed JSON response.
-Argument RESPONSE is request-response object."
-  (unless (= (request-response-status-code response) 200)
-    (error "Failed to fetch models: %s" (request-response-status-code response)))
+      (gptel-copilot--log "Saved %d models to cache" (length models)))))
 
-  (let* ((models-vector (alist-get 'data data))
-         (models (append models-vector nil))  ; Convert vector to list
-         (chat-models nil))
-    ;; Filter for chat models and extract capabilities
+(defun gptel-copilot--enable-model-policy (model-id)
+  "Enable policy for MODEL-ID."
+  (gptel-copilot--log "Enabling policy for model %s" model-id)
+
+  (request (format "https://api.githubcopilot.com/models/%s/policy" model-id)
+    :type "POST"
+    :headers (gptel-copilot--request-headers)
+    :data (json-encode '((state . "enabled")))
+    :parser 'json-read
+    :success (cl-function
+              (lambda (&key data &allow-other-keys)
+                (gptel-copilot--log "Successfully enabled policy for %s" model-id)))
+    :error (cl-function
+            (lambda (&key error-thrown &allow-other-keys)
+              (gptel-copilot--log "Error enabling policy: %S" error-thrown)))))
+
+(defun gptel-copilot--format-models-for-gptel ()
+  "Format Copilot models for gptel backend."
+  (let* ((models-vector (gptel-copilot--get-models))
+         (models (append models-vector nil))
+         (result '())
+         ;; Descriptions dictionary
+         (model-descriptions
+          '(("gpt-4o" . "Advanced model for complex tasks; cheaper & faster than GPT-Turbo")
+            ("gpt-4" . "Powerful model for high-quality text generation")
+            ("gpt-3.5-turbo" . "Fast and efficient model for general use")
+            ("claude-3.5-sonnet" . "Anthropic's balanced reasoning model")
+            ("claude-3-opus" . "Anthropic's most powerful model for complex tasks")
+            ("claude-3-sonnet" . "Balanced performance and intelligence")
+            ("claude-3.7-sonnet" . "Latest Claude model with enhanced reasoning")
+            ("claude-3.7-sonnet-thought" . "Claude model with visible thinking process")
+            ("o1" . "OpenAI's expert reasoning model")
+            ("o3-mini" . "Compact reasoning model with strong performance")
+            ("gemini-2.0-flash" . "Google's fast and efficient language model"))))
+
     (dolist (model models)
-      (when (and (alist-get 'capabilities model)
-                 (equal (alist-get 'type (alist-get 'capabilities model)) "chat"))
-        (push model chat-models)))
-
-    (when gptel-copilot-chat-debug
-      (message "Fetched %d models" (length chat-models))
-      (message "Models: %s" chat-models))
-
-    ;; Store models in instance and return them
-    (let ((sorted-models (nreverse chat-models)))
-      (setf (gptel-copilot-chat-models gptel-copilot-chat--instance) sorted-models)
-
-      ;; Cache models to disk
-      (gptel-copilot-chat--save-models-to-cache sorted-models)
-
-      ;; Enable policies for models if needed
-      (dolist (model sorted-models)
-        (when (and (alist-get 'policy model)
-                   (equal (alist-get 'state (alist-get 'policy model)) "unconfigured"))
-          (gptel-copilot-chat--request-enable-model-policy (alist-get 'id model))))
-
-      ;; Return the models list for immediate use
-      sorted-models)))
-
-(defun gptel-copilot-chat--request-models (&optional quiet)
-  "Fetch available models from Copilot API.
-Optional argument QUIET suppresses user messages when non-nil."
-  (let ((url "https://api.githubcopilot.com/models")
-        (headers (gptel-copilot-chat--get-headers)))
-    (when gptel-copilot-chat-debug
-      (message "Fetching models from %s" url))
-    (unless quiet
-      (message "Fetching available Copilot models..."))
-    (request url
-      :type "GET"
-      :headers headers
-      :parser 'json-read
-      :sync t  ; Use synchronous request when called directly
-      :complete #'gptel-copilot-chat--request-models-cb)))
-
-;; Define a helper function to load models from cache
-(defun gptel-copilot--get-models-from-cache ()
-  "Load Copilot models from cache file."
-  (when (file-exists-p gptel-copilot-chat-models-cache-file)
-    (condition-case nil
-        (with-temp-buffer
-          (insert-file-contents gptel-copilot-chat-models-cache-file)
-          (let* ((cache-data (json-read-from-string (buffer-substring-no-properties
-                                                    (point-min) (point-max))))
-                 (timestamp (alist-get 'timestamp cache-data))
-                 (models (alist-get 'models cache-data)))
-            (when gptel-copilot-chat-debug
-              (message "Loaded %d models from cache" (length models)))
-            (setf (gptel-copilot-chat-models gptel-copilot-chat--instance) models)
-            (setf (gptel-copilot-chat-last-models-fetch-time gptel-copilot-chat--instance) timestamp)
-            models))
-      (error
-       (when gptel-copilot-chat-debug
-         (message "Error loading models from cache"))
-       nil))))
-
-(defun gptel-copilot-extract-formatted-models ()
-  "Extract models from gptel-copilot-chat--instance and format them for gptel."
-  ;; Check if we need to refresh models (models empty or cache expired)
-  (let ((cache-timeout (* 60 60 24))  ; 24 hour cache expiration
-        (current-time (float-time)))
-
-    ;; First, try to load from cache if available and models are empty
-    (when (and (null (gptel-copilot-chat-models gptel-copilot-chat--instance))
-               (file-exists-p gptel-copilot-chat-models-cache-file))
-      (gptel-copilot--get-models-from-cache))
-
-    ;; Check if we need to refresh models
-    (when (or (null (gptel-copilot-chat-models gptel-copilot-chat--instance))
-              (> current-time
-                 (+ (gptel-copilot-chat-last-models-fetch-time gptel-copilot-chat--instance)
-                    cache-timeout)))
-      (when gptel-copilot-chat-debug
-        (message "Models cache expired or empty, fetching new models..."))
-      (gptel-copilot-chat--request-models t)))
-
-  (let* ((models-vector (gptel-copilot-chat-models gptel-copilot-chat--instance))
-        (models-list (append models-vector nil))  ; Convert vector to list
-        (result '())
-        ;; Descriptions dictionary (can be expanded with better descriptions)
-        (model-descriptions
-         '(("gpt-4o" . "Advanced model for complex tasks; cheaper & faster than GPT-Turbo")
-           ("gpt-4" . "Powerful model for high-quality text generation")
-           ("gpt-3.5-turbo" . "Fast and efficient model for general use")
-           ("claude-3.5-sonnet" . "Anthropic's balanced reasoning model")
-           ("claude-3.7-sonnet" . "Latest Claude model with enhanced reasoning")
-           ("claude-3.7-sonnet-thought" . "Claude model with visible thinking process") ("o1" . "OpenAI's expert reasoning model")
-           ("o3-mini" . "Compact reasoning model with strong performance")
-           ("gemini-2.0-flash" . "Google's fast and efficient language model"))))
-
-    (dolist (model models-list)
       (let* ((id (alist-get 'id model))
              (name (alist-get 'name model))
              (capabilities (alist-get 'capabilities model))
@@ -345,11 +399,13 @@ Optional argument QUIET suppresses user messages when non-nil."
            ((string-match-p "gpt-4o" id)
             (setq input-cost 2.5 output-cost 10.0 cutoff-date "2023-10"))
            ((string-match-p "gpt-4" id)
-            (setq input-cost 3.0 output-cost 12.0 cutoff-date "2023-04"))
+            (setq input-cost 10.0 output-cost 30.0 cutoff-date "2023-04"))
            ((string-match-p "claude-3\\.7" id)
             (setq input-cost 3.0 output-cost 15.0 cutoff-date "2024-09"))
+           ((string-match-p "claude-3-opus" id)
+            (setq input-cost 15.0 output-cost 75.0 cutoff-date "2023-12"))
            ((string-match-p "claude" id)
-            (setq input-cost 2.0 output-cost 8.0 cutoff-date "2024-03"))
+            (setq input-cost 3.0 output-cost 15.0 cutoff-date "2023-12"))
            ((string-match-p "gemini" id)
             (setq input-cost 1.5 output-cost 6.0 cutoff-date "2024-05")))
 
@@ -373,84 +429,58 @@ Optional argument QUIET suppresses user messages when non-nil."
     ;; Return the sorted list of models
     (nreverse result)))
 
-;;(gptel-copilot-chat--request-models nil)
+;;; Backend integration
 
-;; Helpers specifically for gptel-make-*
-(defun gptel-copilot--get-headers ()
+(defun gptel-copilot--request-headers ()
   "Get headers for Copilot API requests."
-  (when-let* ((key (gptel--get-api-key)))
-  `(("Authorization" . ,(concat "Bearer " key))
+  `(("authorization" . ,(concat "Bearer " (gptel-copilot--get-session-token)))
     ("openai-intent" . "conversation-panel")
     ("content-type" . "application/json")
     ("accept" . "application/json")
-    ;;("user-agent" . "CopilotChat.nvim/2.0.0")
-    ;;("editor-plugin-version" . "CopilotChat.nvim/2.0.0")
-    ;;("x-request-id" . ,(gptel-copilot-chat--uuid))
-    ;;("vscode-sessionid" . ,(gptel-copilot-chat-sessionid gptel-copilot-chat--instance))
-    ;;("vscode-machineid" . ,(gptel-copilot-chat-machineid gptel-copilot-chat--instance))
+    ("user-agent" . "CopilotChat.nvim/2.0.0")
+    ("editor-plugin-version" . "CopilotChat.nvim/2.0.0")
+    ("x-request-id" . ,(gptel-copilot--uuid))
+    ("editor-version" . "Neovim/0.10.0")
     ("copilot-integration-id" . "vscode-chat")
-    ("openai-organization" . "github-copilot")
-    ("editor-version" . "Neovim/0.10.0"))))
-
-(defun gptel-copilot--get-access-token ()
-  (let ((token-file (expand-file-name gptel-copilot-chat-github-token-file)))
-    (if (file-exists-p token-file)
-        (progn
-          (setf (gptel-copilot-chat-github-token gptel-copilot-chat--instance)
-                (with-temp-buffer
-                  (insert-file-contents token-file)
-                  (buffer-substring-no-properties (point-min) (point-max)))))
-      (gptel-copilot--request-login)
-      )))
-
-(defun gptel-copilot--get-session-token ()
-  (gptel-copilot--get-access-token)
-  (when (null (gptel-copilot-chat-token gptel-copilot-chat--instance))
-    ;; try to load token from ~/.cache/copilot-chat-token
-    (let ((token-file (expand-file-name gptel-copilot-chat-token-cache)))
-      (when (file-exists-p token-file)
-        (with-temp-buffer
-          (insert-file-contents token-file)
-          (setf (gptel-copilot-chat-token gptel-copilot-chat--instance) (json-read-from-string (buffer-substring-no-properties (point-min) (point-max))))))))
-
-  (when (or (null (gptel-copilot-chat-token gptel-copilot-chat--instance))
-            (> (round (float-time (current-time))) (alist-get 'expires_at (gptel-copilot-chat-token gptel-copilot-chat--instance))))
-    (gptel-copilot-chat--request-renew-token))
-  (alist-get 'token (gptel-copilot-chat-token gptel-copilot-chat--instance)))
+    ("openai-organization" . "github-copilot")))
 
 ;;;###autoload
 (cl-defun gptel-make-copilot
-    (name &key curl-args stream request-params
-          (header #'gptel-copilot--get-headers)
+    (name &key curl-args models stream request-params
+          (header #'gptel-copilot--request-headers)
           (key #'gptel-copilot--get-session-token)
           (host "api.githubcopilot.com")
           (protocol "https")
-          (endpoint "/chat/completions")
-          (models (gptel-copilot-extract-formatted-models)))
-  "Register a Copilot API-compatible backend for gptel with NAME.
+          (endpoint "/chat/completions"))
+  "Register a GitHub Copilot backend for gptel with NAME.
 
 Keyword arguments:
 CURL-ARGS (optional) is a list of additional Curl arguments.
-HOST (optional) is the API host, \"api.githubcopilot.com\" by default.
 STREAM is a boolean to toggle streaming responses.
-PROTOCOL (optional) specifies the protocol, https by default.
+HOST (optional) is the API host, defaults to \"api.githubcopilot.com\".
+PROTOCOL (optional) specifies the protocol, defaults to https.
 ENDPOINT (optional) is the API endpoint for completions.
-HEADER (optional) is for additional headers to send with each request. It should be an alist or a function that returns an alist.
-KEY (optional) is a variable whose value is the session token, or function that returns the session token.
 REQUEST-PARAMS (optional) is a plist of additional HTTP request parameters."
   (declare (indent 1))
+
+  ;; Ensure cache directories exist
+  (gptel-copilot--ensure-directories)
+
+  ;; Create and register the backend
   (let ((backend (gptel--make-openai
-                  :curl-args curl-args
                   :name name
+                  :curl-args curl-args
                   :host host
                   :header header
                   :key key
-                  :models (gptel--process-models models) ;; TODO: get from model-cache
+                  :models (gptel--process-models models)
                   :protocol protocol
                   :endpoint endpoint
                   :stream stream
                   :request-params request-params
                   :url (concat protocol "://" host endpoint))))
+
+    ;; Register the backend with gptel
     (prog1 backend
       (setf (alist-get name gptel--known-backends nil nil #'equal) backend))))
 
